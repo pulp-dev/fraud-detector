@@ -1,110 +1,154 @@
 # Real-Time Fraud Detection System
 
-DISCLAIMER
+Сервис обнаружения мошеннических транзакций в реальном времени. Транзакции поступают потоком через Kafka, сервис скоринга применяет собственную модель CatBoost (inference на CPU) и публикует скор и флаг фрода в Kafka. Отдельный сервис сохраняет результаты в Postgres, а UI показывает последние фродовые транзакции и распределение скоров.
 
-Сервис подготовлен в демонстрационных целях для студентов курса МТС ШАД 2025 в рамках занятий по MLOps. Датасеты предоставлены в рамках соревнования https://www.kaggle.com/competitions/teta-ml-1-2025
-
-Система для обнаружения мошеннических транзакций в реальном времени с использованием ML-модели и Kafka для потоковой обработки данных.
+Данные: соревнование [teta-ml-1-2025](https://www.kaggle.com/competitions/teta-ml-1-2025).
 
 ## 🏗️ Архитектура
 
-Компоненты системы:
-1. **`interface`** (Streamlit UI):
-   
-   Создан для удобной симуляции потоковых данных с транзакциями. Реальный продукт использовал бы прямой поток данных из других систем.
-    - Имитирует отправку транзакций в Kafka через CSV-файлы.
-    - Генерирует уникальные ID для транзакций.
-    - Загружает транзакции отдельными сообщениями формата JSON в топик kafka `transactions`.
-    
+```
+ interface (Streamlit) ──► [transactions] ──► fraud_detector ──► [scoring] ──► score_writer ──► Postgres (scores)
+         ▲                                                                                        │
+         └────────────── вкладка «Результаты» (SELECT) ◄──────────────────────────────────────────┘
+```
 
-2. **`fraud_detector`** (ML Service):
-   - Загружает предобученную модель CatBoost (`my_catboost.cbm`).
-   - Выполняет препроцессинг данных:
-     - Извлечение временных признаков
-     - Гео-расстояния
-     - Кодирование категориальных переменных
-   - Производит скоринг с порогом 0.98.
-   - Выгружает результат скоринга в топик kafka `scoring`
+| Сервис | Назначение | Порт на хосте |
+|---|---|---|
+| `interface` | Streamlit UI: отправка CSV в Kafka и просмотр результатов из Postgres | 8501 |
+| `fraud_detector` | Kafka consumer/producer: препроцессинг + скоринг моделью | — |
+| `score_writer` | Читает топик `scoring` и пишет результаты в Postgres | — |
+| `postgres` | Витрина `scores` (transaction_id, score, fraud_flag, created_at) | 5432 |
+| `kafka`, `zookeeper` | Брокер сообщений | 9095 (внешний listener) |
+| `kafka-setup` | Создаёт топики `transactions` и `scoring` и завершается | — |
+| `kafka-ui` | Веб-интерфейс для просмотра топиков | 8080 |
 
-3. **Kafka Infrastructure**:
-   - Zookeeper + Kafka брокер
-   - `kafka-setup`: автоматически создает топики `transactions` и `scoring`
-   - Kafka UI: веб-интерфейс для мониторинга сообщений (порт 8080)
+### Сервис скоринга `fraud_detector`
+Этапы разнесены по отдельным скриптам:
+- `app/app.py` — чтение сообщений из топика `transactions` и публикация `{transaction_id, score, fraud_flag}` в топик `scoring`;
+- `src/preprocessing.py` — препроцессинг (тот же код используется при обучении);
+- `src/scorer.py` — скоринг обработанного сообщения моделью CatBoost на CPU.
+
+Сервис делает только inference. Модель и статистики препроцессинга лежат в `fraud_detector/models/`, поэтому обучающие данные контейнеру не нужны.
 
 ## 🚀 Быстрый старт
 
 ### Требования
-- Docker 20.10+
-- Docker Compose 2.0+
+- Docker 20.10+ и Docker Compose v2
+- Свободные порты 8080, 8501, 9095, 5432, 2181
 
 ### Запуск
 ```bash
-git clone https://github.com/your-repo/fraud-detection-system.git
-cd fraud-detection-system
+git clone <URL этого репозитория>
+cd mts25_mlops_hw2_real_time_fraud_detection
 
-# Сборка и запуск всех сервисов
-docker-compose up --build
+docker compose up --build -d
+docker compose ps
 ```
-После запуска:
+Через 30–60 секунд все сервисы должны быть в статусе `Up`, а `kafka-setup` — `Exited (0)`: он только создаёт топики.
+
 - **Streamlit UI**: http://localhost:8501
 - **Kafka UI**: http://localhost:8080
-- **Логи сервисов**: 
-  ```bash
-  docker-compose logs <service_name>  # Например: fraud_detector, kafka, interface
 
-## 🛠️ Использование
+### Проверка работы
+1. Откройте http://localhost:8501, вкладка **«📤 Отправка транзакций»**.
+2. Загрузите файл `samples/test_sample.csv` (200 транзакций в формате `test.csv`) или `test.csv` из соревнования и нажмите **«Отправить …»**.
+3. В Kafka UI (http://localhost:8080 → Topics) убедитесь, что сообщения появились в `transactions` и `scoring`.
+4. Проверьте витрину в Postgres:
+   ```bash
+   docker compose exec postgres psql -U fraud -d fraud \
+     -c "SELECT count(*) AS total, sum(fraud_flag) AS frauds FROM scores;"
+   ```
+5. В UI откройте вкладку **«📊 Результаты»** и нажмите **«Посмотреть результаты»**. Появятся:
+   - 10 последних транзакций с `fraud_flag = 1` (если такие есть);
+   - гистограмма скоров последних 100 транзакций (или всех, если в базе их меньше).
 
-### 1. Загрузка данных:
+> `samples/test_sample.csv` — 200 строк из train без колонки `target` (20 из них мошеннические), чтобы в результатах гарантированно были фродовые транзакции.
 
- - Загрузите CSV через интерфейс Streamlit. Для тестирования работы проекта используется файл формата `test.csv` из соревнования https://www.kaggle.com/competitions/teta-ml-1-2025
- - Пример структуры данных:
-    ```csv
-    transaction_time,amount,lat,lon,merchant_lat,merchant_lon,gender,...
-    2023-01-01 12:30:00,150.50,40.7128,-74.0060,40.7580,-73.9855,M,...
-    ```
- - Для первых тестов рекомендуется загружать небольшой семпл данных (до 100 транзакций) за раз, чтобы исполнение кода не заняло много времени.
+### Логи и остановка
+```bash
+docker compose logs -f fraud_detector score_writer
+docker compose down        # остановить
+docker compose down -v     # остановить и удалить данные Postgres
+```
 
-### 2. Мониторинг:
- - **Kafka UI**: Просматривайте сообщения в топиках transactions и scoring
- - **Логи обработки**: /app/logs/service.log внутри контейнера fraud_detector
+## 📨 Форматы сообщений
 
-### 3. Результаты:
+Топик `transactions` (отправляет UI):
+```json
+{"transaction_id": "d6b0f7a0-...", "data": {"transaction_time": "2019-12-27 15:21", "merch": "...", "amount": 148.04, "...": "..."}}
+```
 
- - Скоринговые оценки пишутся в топик scoring в формате:
-    ```json
-    {
-    "score": 0.995, 
-    "fraud_flag": 1, 
-    "transaction_id": "d6b0f7a0-8e1a-4a3c-9b2d-5c8f9d1e2f3a"
-    }
-    ```
-## Структура проекта
+Топик `scoring` (отправляет `fraud_detector`):
+```json
+{"transaction_id": "d6b0f7a0-...", "score": 0.0123, "fraud_flag": 0}
+```
+
+Витрина `scores` в Postgres (`postgres/init.sql`):
+```sql
+transaction_id TEXT PRIMARY KEY, score DOUBLE PRECISION, fraud_flag SMALLINT, created_at TIMESTAMPTZ
+```
+Повторная доставка одного и того же сообщения не создаёт дублей (`ON CONFLICT DO NOTHING`).
+
+## 🤖 Модель
+
+CatBoostClassifier, обучение и inference только на CPU.
+
+Признаки (`fraud_detector/src/preprocessing.py`):
+- время: час, день недели, день месяца, месяц, флаги ночи и выходного;
+- `log(amount)`, `log(population_city)`, отношение суммы к медиане суммы по категории `cat_id`;
+- расстояние клиент — мерчант (haversine, км);
+- частотное кодирование `merch`, `jobs`, `one_city`;
+- категориальные признаки `merch`, `cat_id`, `gender`, `us_state`, `jobs`, `one_city` обрабатываются нативно в CatBoost; редкие значения объединяются в `__rare__`;
+- персональные данные (`name_1`, `name_2`, `street`, `post_code`) не используются.
+
+Порог `fraud_flag` подобран по максимуму F1 на отложенной выборке (20 %, стратифицированно). Затем модель переобучена на всех данных с найденным числом итераций.
+
+| Метрика (holdout 20 %) | Значение |
+|---|---|
+| ROC-AUC | 0.997 |
+| PR-AUC | 0.891 |
+| F1 | 0.836 |
+| Порог `fraud_flag` | 0.458 |
+
+Для компактности модели (≈1.8 МБ) используется `max_ctr_complexity=1`: без этого CTR-таблицы по комбинациям категорий раздувают модель до ~220 МБ, что не помещается в GitHub. Метрики и порог также сохранены в `fraud_detector/models/preprocessing_artifacts.json` (`validation_metrics`).
+
+### Переобучение (необязательно — готовая модель уже в репозитории)
+```bash
+python -m venv .venv && source .venv/bin/activate
+pip install -r training/requirements.txt
+# положите train.csv из соревнования в fraud_detector/train_data/train.csv
+python training/train.py
+docker compose up --build -d fraud_detector
+```
+
+## 📁 Структура проекта
 ```
 .
-├── fraud_detector/
-│   ├── preprocessing.py    # Логика препроцессинга
-│   ├── scorer.py           # ML-модель и предсказания
-│   ├── app.py              # Kafka Consumer/Producer
-│   └── Dockerfile
-├── interface/
-│   └── app.py              # Streamlit UI
 ├── docker-compose.yaml
-└── README.md
+├── fraud_detector/            # сервис скоринга
+│   ├── app/app.py             # Kafka consumer/producer
+│   ├── src/preprocessing.py   # препроцессинг
+│   ├── src/scorer.py          # скоринг моделью
+│   ├── models/                # model.cbm + preprocessing_artifacts.json
+│   ├── Dockerfile
+│   └── requirements.txt
+├── score_writer/              # scoring -> Postgres
+│   ├── app.py
+│   ├── Dockerfile
+│   └── requirements.txt
+├── interface/                 # Streamlit UI
+│   ├── app.py
+│   ├── Dockerfile
+│   └── requirements.txt
+├── postgres/init.sql          # создание витрины scores
+├── training/                  # обучение модели (вне контейнеров)
+│   ├── train.py
+│   └── requirements.txt
+└── samples/test_sample.csv    # тестовые транзакции
 ```
 
-## Настройки Kafka
-```yml
-Топики:
-- transactions (входные данные)
-- scoring (результаты скоринга)
-
-Репликация: 1 (для разработки)
-Партиции: 3
-```
-
-*Примечание:* 
-
-Для полной функциональности убедитесь, что:
-1. Модель `my_catboost.cbm` размещена в `fraud_detector/models/`
-2. Тренировочные данные находятся в `fraud_detector/train_data/`
-3. Порты 8080, 8501 и 9095 свободны на хосте
+## 🛠️ Troubleshooting
+- **В `scoring` нет сообщений** — смотрите `docker compose logs fraud_detector`: сервис ждёт появления топиков и пишет ошибки обработки в лог.
+- **Во вкладке «Результаты» пусто** — проверьте `docker compose logs score_writer` и запрос `SELECT count(*) FROM scores`.
+- **Порт занят** — освободите порт или поменяйте маппинг `ports` в `docker-compose.yaml`.
+- **Нужно начать с чистой базы** — `docker compose down -v && docker compose up --build -d`.

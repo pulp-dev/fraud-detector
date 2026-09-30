@@ -1,0 +1,8 @@
+.DS_Store
+.venv/
+__pycache__/
+*.pyc
+*.csv
+!samples/*.csv
+fraud_detector/train_data/
+catboost_info/

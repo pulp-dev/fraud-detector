@@ -72,6 +72,7 @@ services:
       KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:9092
       KAFKA_CLUSTERS_0_ZOOKEEPER: zookeeper:2181
 
+  # Сервис скоринга: transactions -> модель -> scoring
   fraud_detector:
     build: ./fraud_detector
     networks:
@@ -81,9 +82,50 @@ services:
       KAFKA_TRANSACTIONS_TOPIC: "transactions"
       KAFKA_SCORING_TOPIC: "scoring"
     depends_on:
-      - kafka
-      - kafka-setup
+      kafka-setup:
+        condition: service_completed_successfully
+    restart: on-failure
 
+  # Postgres с витриной результатов скоринга
+  postgres:
+    image: postgres:16-alpine
+    networks:
+      - ml-scorer
+    environment:
+      POSTGRES_DB: "fraud"
+      POSTGRES_USER: "fraud"
+      POSTGRES_PASSWORD: "fraud"
+    ports:
+      - "5432:5432"
+    volumes:
+      - ./postgres/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U fraud -d fraud"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  # Сервис-писатель: scoring -> Postgres
+  score_writer:
+    build: ./score_writer
+    networks:
+      - ml-scorer
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: "kafka:9092"
+      KAFKA_SCORING_TOPIC: "scoring"
+      POSTGRES_HOST: "postgres"
+      POSTGRES_DB: "fraud"
+      POSTGRES_USER: "fraud"
+      POSTGRES_PASSWORD: "fraud"
+    depends_on:
+      kafka-setup:
+        condition: service_completed_successfully
+      postgres:
+        condition: service_healthy
+    restart: on-failure
+
+  # UI: отправка транзакций и просмотр результатов
   interface:
     build: ./interface
     networks:
@@ -91,10 +133,20 @@ services:
     environment:
       KAFKA_BROKERS: "kafka:9092"  # Используем внутренний адрес Kafka
       KAFKA_TOPIC: "transactions"
+      POSTGRES_HOST: "postgres"
+      POSTGRES_DB: "fraud"
+      POSTGRES_USER: "fraud"
+      POSTGRES_PASSWORD: "fraud"
     depends_on:
-      - kafka
+      kafka-setup:
+        condition: service_completed_successfully
+      postgres:
+        condition: service_healthy
     ports:
       - "8501:8501"
+
+volumes:
+  pgdata:
 
 networks:
   ml-scorer:

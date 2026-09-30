@@ -1,17 +1,19 @@
+# syntax=docker/dockerfile:1
 FROM python:3.12-slim
 
 WORKDIR /app
 
-# Создание директории для логов
-RUN mkdir -p /app/logs && \
-    touch /app/logs/service.log && \
-    chmod -R 777 /app/logs  # Права на запись для всех пользователей
+# Директория для логов
+RUN mkdir -p /app/logs && chmod -R 777 /app/logs
 
-# Установка зависимостей
+# Установка зависимостей (inference только на CPU)
 COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+RUN --mount=type=cache,target=/root/.cache/pip \
+    pip install --default-timeout=300 --retries 10 -r requirements.txt
 
-# Копирование исходного кода
-COPY . .
+# Код сервиса и артефакты модели
+COPY app/ ./app/
+COPY src/ ./src/
+COPY models/ ./models/
 
 CMD ["python", "./app/app.py"]

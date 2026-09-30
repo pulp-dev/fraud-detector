@@ -1,3 +1,4 @@
+# syntax=docker/dockerfile:1
 FROM python:3.9-slim
 
 WORKDIR /app
@@ -9,7 +10,8 @@ RUN mkdir -p /root/.streamlit
 COPY .streamlit/config.toml /root/.streamlit/config.toml
 
 COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+RUN --mount=type=cache,target=/root/.cache/pip \
+    pip install --default-timeout=300 --retries 10 -r requirements.txt
 
 COPY . .
 
